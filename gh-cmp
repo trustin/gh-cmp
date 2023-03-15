@@ -1,0 +1,198 @@
+#!/usr/bin/env -S zx --install
+import chalk from 'chalk'; // @^5
+import dayjs from 'dayjs'; // @^1
+import relativeTime from 'dayjs/plugin/relativeTime.js';
+import JSON5 from 'json5'; // @^2
+import _ from 'lodash'; // @^4
+import terminalLink from 'terminal-link'; // @^3
+import 'zx/globals';
+
+const configDir = `${process.env['HOME']}/.config/gh-cmp`;
+const configPath = `${configDir}/repositories.json5`;
+const hasConfigFile = fs.existsSync(configPath);
+
+// Write the default settings if user doesn't have one.
+if (!hasConfigFile) {
+  fs.mkdirpSync(configDir);
+  fs.writeFileSync(configPath, `[
+  {
+    // github.com/trustin/gh-cmp
+    owner: 'trustin',
+    name: 'gh-cmp',
+  },
+  // {
+  //   // github-enterprise.acme.com/acme-engineering/acme-server
+  //   host: 'github-enterprise.acme.com',
+  //   owner: 'acme-engineering',
+  //   repo: 'acme-server',
+  // },
+]`);
+  console.log(`Wrote the defaults to ${chalk.greenBright(configPath)}.`);
+  console.log('Put the list of repositories you\'re interested in there.');
+  console.log();
+}
+
+// Read the configuration file and validate it.
+const repositories = JSON5.parse(fs.readFileSync(configPath, 'utf-8'));
+let isConfigValid = true;
+if (!Array.isArray(repositories)) {
+  isConfigValid = false;
+} else {
+  for (const repo of repositories) {
+    if (typeof repo !== 'object') {
+      isConfigValid = false;
+      break;
+    }
+    if (typeof repo.host !== 'string') {
+      if (typeof repo.host === 'undefined') {
+        repo.host = 'github.com'
+      } else {
+        isConfigValid = false;
+        break;
+      }
+    }
+    if (typeof repo.owner !== 'string') {
+      isConfigValid = false;
+      break;
+    }
+    if (typeof repo.name !== 'string') {
+      isConfigValid = false;
+      break;
+    }
+  }
+}
+
+if (!isConfigValid) {
+  console.log('Exiting due to invalid configuration');
+  console.log(`You can delete ${configPath} to go back to the default.`);
+  process.exit(1);
+}
+
+const hostnames = _(repositories).map(e => e.host).uniq();
+
+const ItemTypes = {
+  ISSUE: {
+    pluralFriendlyName: 'issues',
+    graphqlFunctionName: 'issues',
+  },
+  PULL_REQUEST: {
+    pluralFriendlyName: 'pull requests',
+    graphqlFunctionName: 'pullRequests',
+  },
+};
+
+const terminalColumns = process.stdout.columns;
+const terminalLinkSupported = terminalLink.isSupported;
+const horizLine = chalk.gray('─'.repeat(terminalColumns));
+dayjs.extend(relativeTime);
+$.verbose = false;
+
+// Ensure all hostnames were configured correctly.
+for (const host of hostnames) {
+  try {
+    await spinner(
+      `Checking GitHub CLI configuration for ${chalk.greenBright(host)} ..`,
+      () => $`gh api --hostname=${host} status >/dev/null`);
+  } catch (e) {
+    console.log(`Please configure GitHub CLI properly for ${chalk.greenBright(host)}:\n\n  ${chalk.redBright(e.stderr)}`)
+    process.exit(1);
+  }
+}
+
+let isFirstRepo = true;
+let printedItems = false;
+for (const repo of repositories) {
+  repo.items = [
+    ...await fetchItems(repo, ItemTypes.PULL_REQUEST),
+    ...await fetchItems(repo, ItemTypes.ISSUE),
+  ].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+for (const repo of repositories) {
+  if (repo.items.length > 0) {
+    // Print an empty line between repositories.
+    if (isFirstRepo) {
+      isFirstRepo = false;
+    } else {
+      console.log();
+    }
+
+    // Print the repository name.
+    console.log(horizLine);
+    console.log(`${chalk.greenBright(repo.owner)}${chalk.gray('/')}${chalk.greenBright(repo.name)} ${chalk.gray(`(${repo.host})`)}`);
+    console.log(horizLine);
+
+    // Print all items of the repository.
+    const maxDigits = _(repo.items).map(e => Math.floor(Math.log10(e.number)) + 1).max();
+    for (const item of repo.items) {
+      const typeIndicator = item.isPullRequest ? '🅿' : '🅸';
+      const itemNumber = `#${item.number}`;
+      const itemNumberPadding = ' '.repeat(maxDigits + 1 - itemNumber.length);
+      const humanReadableDate = dayjs().to(item.updatedAt);
+
+      // Truncate the title if necessary.
+      const maxTitleLength =
+        (terminalColumns - 1) -
+        (
+          typeIndicator.length + 1 +
+          itemNumber.length + itemNumberPadding.length + 1 +
+          1 + humanReadableDate.length
+        );
+      const title = item.title.length > maxTitleLength
+        ? item.title.substring(0, maxTitleLength - 1) + '…'
+        : item.title;
+
+      if (terminalLinkSupported) {
+        console.log(`${chalk.white(typeIndicator)} ${terminalLink(itemNumber, item.url)}${itemNumberPadding} ${title} ${chalk.magenta(humanReadableDate)}`);
+      } else {
+        console.log(`${chalk.white(typeIndicator)} ${itemNumber}${itemNumberPadding} ${title} ${chalk.magenta(humanReadableDate)}`);
+      }
+      console.log(`${' '.repeat(typeIndicator.length + itemNumber.length + itemNumberPadding.length + 1)}${chalk.blue(item.url)}`);
+
+      printedItems = true;
+    }
+  }
+}
+
+if (!printedItems) {
+  console.log("Hooray, no unread items here! 🍻")
+}
+
+async function fetchItems(repo, itemType) {
+  const edges = JSON.parse((await spinner(
+    `${chalk.greenBright(repo.host)}${chalk.gray(':')}${chalk.greenBright(repo.owner)}${chalk.gray('/')}${chalk.greenBright(repo.name)}${chalk.gray(':')} Fetching ${itemType.pluralFriendlyName} ..`,
+    () => $`gh api --hostname=${repo.host} graphql -F owner=${repo.owner} -F name=${repo.name} -f query='
+      query(\$owner: String!, \$name: String!) {
+        repository(owner: \$owner, name: \$name) {
+          items: ${itemType.graphqlFunctionName}(
+            first: 100,
+            states: OPEN,
+            orderBy: {
+              field: UPDATED_AT,
+              direction: DESC
+            }
+          ) {
+            edges {
+              node {
+                number
+                title
+                url
+                updatedAt
+                isReadByViewer
+              }
+            }
+          }
+        }
+      }
+    '`)).stdout).data.repository.items.edges;
+
+  return _(edges).filter(e => !e.node.isReadByViewer).map(e => {
+    return {
+      number: e.node.number,
+      title: e.node.title,
+      url: e.node.url,
+      updatedAt: new Date(e.node.updatedAt),
+      isPullRequest: itemType === ItemTypes.PULL_REQUEST,
+    };
+  }).toArray();
+}
